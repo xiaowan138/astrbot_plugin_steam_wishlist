@@ -1,0 +1,50 @@
+{
+  "enable_auto_check": {
+    "description": "启用后台自动价格检查",
+    "hint": "关闭后仅可通过 /sw check 手动检查",
+    "type": "bool",
+    "default": true
+  },
+  "check_interval_hours": {
+    "description": "自动检查间隔(小时)",
+    "hint": "建议不小于 2 小时,间隔过短可能触发 Steam 风控",
+    "type": "int",
+    "default": 6
+  },
+  "discount_threshold": {
+    "description": "折扣推送阈值(%)",
+    "hint": "折扣百分比达到或超过该值才推送,0 表示任何折扣都推送",
+    "type": "int",
+    "default": 30
+  },
+  "region": {
+    "description": "Steam 商店区域代码",
+    "hint": "影响查询到的货币与价格,如 cn(人民币)、us(美元)、jp(日元)",
+    "type": "string",
+    "default": "cn"
+  },
+  "language": {
+    "description": "返回的游戏名称语言",
+    "hint": "如 schinese(简中)、tchinese(繁中)、english",
+    "type": "string",
+    "default": "schinese"
+  },
+  "request_delay_seconds": {
+    "description": "批量查询时相邻请求的间隔(秒)",
+    "hint": "防止触发 Steam 风控,不建议低于 1",
+    "type": "float",
+    "default": 1.5
+  },
+  "notify_lowest_only": {
+    "description": "仅在史低或低于史低价时推送",
+    "hint": "开启后忽略普通折扣,只关注历史最低价(基于插件运行期间记录)",
+    "type": "bool",
+    "default": false
+  },
+  "push_targets": {
+    "description": "额外推送目标(unified_msg_origin 列表)",
+    "hint": "通常无需手填,直接在会话中发送 /sw bind 即可绑定;此项用于手动追加",
+    "type": "list",
+    "default": []
+  }
+}

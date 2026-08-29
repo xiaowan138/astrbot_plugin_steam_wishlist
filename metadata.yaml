@@ -1,0 +1,7 @@
+name: astrbot_plugin_steam_wishlist
+display_name: Steam 愿望单监控
+desc: 监控 Steam 愿望单/单游戏价格,折扣达到阈值或史低时自动推送到会话
+short_desc: Steam 折扣监控,达到阈值/史低自动推送
+version: v0.1.0
+author: xiaowan138
+repo: https://github.com/xiaowan138/astrbot_plugin_steam_wishlist
