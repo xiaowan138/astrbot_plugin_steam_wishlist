@@ -8,11 +8,13 @@
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass
 
 import aiohttp
 
 STORE_API = "https://store.steampowered.com/api/appdetails"
+SEARCH_API = "https://store.steampowered.com/api/storesearch/"
 WISHLIST_API = "https://api.steampowered.com/IWishlistService/GetWishlist/v1/"
 COMMUNITY_ID_URL = "https://steamcommunity.com/id/{vanity}/"
 
@@ -25,11 +27,23 @@ DEFAULT_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
-APP_URL_PATTERN = re.compile(r"store\.steampowered\.com/app/(\d+)", re.IGNORECASE)
-WISHLIST_ID_PATTERN = re.compile(
-    r"wishlist/profiles/(\d{17})", re.IGNORECASE
+CURRENCY_SYMBOLS = {
+    "CNY": "¥", "USD": "$", "EUR": "€", "JPY": "¥", "GBP": "£",
+    "HKD": "HK$", "TWD": "NT$", "RUB": "₽", "KRW": "₩", "SGD": "S$",
+}
+
+APP_URL_PATTERN = re.compile(
+    r"(?:store\.steampowered\.com|store\.steamchina\.com)/app/(\d+)", re.IGNORECASE
 )
-WISHLIST_VANITY_PATTERN = re.compile(r"wishlist/id/([A-Za-z0-9_-]+)/", re.IGNORECASE)
+# 两种愿望单链接形态: store 站的 /wishlist/profiles/xxx 与社区站的 /profiles/xxx/wishlist
+WISHLIST_ID_PATTERNS = [
+    re.compile(r"wishlist/profiles/(\d{17})", re.IGNORECASE),
+    re.compile(r"profiles/(\d{17})/wishlist", re.IGNORECASE),
+]
+WISHLIST_VANITY_PATTERNS = [
+    re.compile(r"wishlist/id/([A-Za-z0-9_-]+)/?", re.IGNORECASE),
+    re.compile(r"id/([A-Za-z0-9_-]+)/wishlist", re.IGNORECASE),
+]
 STEAMID_IN_HTML_PATTERN = re.compile(r"steamid[\"']?\s*[:=]\s*[\"']?(\d{17})", re.IGNORECASE)
 
 
@@ -66,12 +80,14 @@ def extract_appid(text: str) -> int | None:
 
 def extract_wishlist_steamid(text: str) -> str | None:
     """从愿望单链接中提取 64 位 SteamID 或自定义URL名。"""
-    matched = WISHLIST_ID_PATTERN.search(text)
-    if matched:
-        return matched.group(1)
-    matched = WISHLIST_VANITY_PATTERN.search(text)
-    if matched:
-        return f"vanity:{matched.group(1)}"
+    for pattern in WISHLIST_ID_PATTERNS:
+        matched = pattern.search(text)
+        if matched:
+            return matched.group(1)
+    for pattern in WISHLIST_VANITY_PATTERNS:
+        matched = pattern.search(text)
+        if matched:
+            return f"vanity:{matched.group(1)}"
     text = text.strip()
     if re.fullmatch(r"\d{17}", text):
         return text
@@ -82,6 +98,10 @@ def extract_wishlist_steamid(text: str) -> str | None:
 
 class SteamAPIError(Exception):
     """Steam 接口请求失败或返回异常数据。"""
+
+
+class AppNotFoundError(SteamAPIError):
+    """AppID 已下架或不存在(appdetails 明确返回 success=false)。"""
 
 
 class SteamAPI:
@@ -113,10 +133,10 @@ class SteamAPI:
         """节流 GET 请求,返回解析后的 JSON(或原始文本)。"""
         session = await self._get_session()
         async with self._lock:
-            elapsed = asyncio.get_event_loop().time() - self._last_request_ts
+            elapsed = time.monotonic() - self._last_request_ts
             if elapsed < self.delay:
                 await asyncio.sleep(self.delay - elapsed)
-            self._last_request_ts = asyncio.get_event_loop().time()
+            self._last_request_ts = time.monotonic()
         async with session.get(url, params=params) as resp:
             if resp.status == 429:
                 raise SteamAPIError("请求过于频繁,已被 Steam 临时限流,请稍后再试或调大请求间隔")
@@ -136,7 +156,7 @@ class SteamAPI:
             raise SteamAPIError(f"AppID {appid} 返回了非预期数据")
         entry = data.get(str(appid)) or {}
         if not entry.get("success") or "data" not in entry:
-            raise SteamAPIError(f"AppID {appid} 查询失败(可能已下架或参数错误)")
+            raise AppNotFoundError(f"AppID {appid} 查询失败(可能已下架或参数错误)")
         detail = entry["data"]
         overview = detail.get("price_overview")
         if overview:
@@ -184,6 +204,34 @@ class SteamAPI:
             if appid.isdigit():
                 result[appid] = appid
         return result
+
+    async def search_games(self, term: str, limit: int = 10) -> list[dict]:
+        """按名称搜索游戏,返回 [{appid, name, price_display}],供 /sw search 使用。"""
+        data = await self._throttled_get(
+            SEARCH_API, {"term": term, "cc": self.region, "l": self.language}
+        )
+        if not isinstance(data, dict):
+            raise SteamAPIError("搜索接口返回了非预期数据")
+        results: list[dict] = []
+        for item in data.get("items") or []:
+            if not isinstance(item, dict) or item.get("type") != "app":
+                continue
+            price = item.get("price") or {}
+            final = price.get("final")
+            display = ""
+            if final is not None:
+                symbol = CURRENCY_SYMBOLS.get(price.get("currency", ""), price.get("currency", ""))
+                display = f"{symbol}{final / 100:g}"
+            results.append(
+                {
+                    "appid": item.get("id"),
+                    "name": item.get("name", ""),
+                    "price_display": display,
+                }
+            )
+            if len(results) >= limit:
+                break
+        return results
 
     async def resolve_vanity(self, vanity: str) -> str:
         """将自定义URL名解析为 64 位 SteamID(解析 Steam 社区个人主页 HTML)。"""
