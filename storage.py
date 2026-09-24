@@ -5,9 +5,9 @@
 
 数据结构:
 - games:            {appid(str): {"name": str, "added_at": int, "source": "manual"|"steam:<steamid>"}}
-- price_state:      {appid(str): {...价格快照与推送状态...}}
+- price_state:      {appid(str): {...价格快照、推送状态、价格历史...}}
 - bindings:         [unified_msg_origin, ...]
-- wishlist_sources: [steamid64, ...]  通过 /sw import 记录,供 /sw sync 使用
+- wishlist_sources: {steamid64: {"label": str, "added_at": int}}  通过 /sw import 记录,供 /sw sync 使用
 - dismissed:        [appid(str), ...]  用户手动移除的来自愿望单的游戏,sync 时不再自动加回
 """
 
@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 
 MANUAL_SOURCE = "manual"
+# 每个游戏最多保留的价格历史点数(用于 /sw history 走势)
+PRICE_HISTORY_LIMIT = 60
 
 
 def steam_source(steamid: str) -> str:
@@ -31,7 +33,7 @@ class Storage:
         self.games: dict[str, dict] = {}
         self.price_state: dict[str, dict] = {}
         self.bindings: list[str] = []
-        self.wishlist_sources: list[str] = []
+        self.wishlist_sources: dict[str, dict] = {}
         self.dismissed: list[str] = []
         self.load()
 
@@ -44,12 +46,23 @@ class Storage:
             self.games = data.get("games", {})
             self.price_state = data.get("price_state", {})
             self.bindings = data.get("bindings", [])
-            self.wishlist_sources = data.get("wishlist_sources", [])
             self.dismissed = data.get("dismissed", [])
+            self.wishlist_sources = self._normalize_sources(data.get("wishlist_sources", []))
         except (json.JSONDecodeError, OSError):
             # 数据文件损坏时保留空态,不中断插件加载
             self.games, self.price_state, self.bindings = {}, {}, []
-            self.wishlist_sources, self.dismissed = [], []
+            self.wishlist_sources, self.dismissed = {}, []
+
+    @staticmethod
+    def _normalize_sources(raw) -> dict[str, dict]:
+        """兼容 v0.2.0 及更早的 list 格式,统一升级为 {steamid: {label, added_at}}。"""
+        if isinstance(raw, dict):
+            return raw
+        normalized: dict[str, dict] = {}
+        for item in raw or []:
+            if isinstance(item, str) and item:
+                normalized[item] = {"label": "", "added_at": int(time.time())}
+        return normalized
 
     def save(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -100,11 +113,30 @@ class Storage:
 
     # ---- 愿望单来源与移除记录 ----
 
-    def add_wishlist_source(self, steamid: str) -> bool:
+    def add_wishlist_source(self, steamid: str, label: str = "") -> bool:
         if steamid in self.wishlist_sources:
+            if label and not self.wishlist_sources[steamid].get("label"):
+                self.wishlist_sources[steamid]["label"] = label
             return False
-        self.wishlist_sources.append(steamid)
+        self.wishlist_sources[steamid] = {"label": label, "added_at": int(time.time())}
         return True
+
+    def remove_wishlist_source(self, steamid: str) -> bool:
+        return self.wishlist_sources.pop(steamid, None) is not None
+
+    def append_history(self, appid: int, final_cents: int, discount_percent: int, ts: int):
+        """记录一个价格观测点,供 /sw history 展示走势。
+
+        与上一次完全相同的价格不重复记录,避免长时间运行后历史被同值填满。
+        金额只存分值,展示时按区域货币统一渲染。
+        """
+        state = self.price_state.setdefault(str(appid), {})
+        history = state.setdefault("history", [])
+        if history and history[-1].get("p") == final_cents:
+            return
+        history.append({"t": ts, "p": final_cents, "d": discount_percent})
+        if len(history) > PRICE_HISTORY_LIMIT:
+            del history[: len(history) - PRICE_HISTORY_LIMIT]
 
     def dismiss(self, appid: int):
         """记录用户主动移除的愿望单游戏,/sw sync 时不再自动加回。"""

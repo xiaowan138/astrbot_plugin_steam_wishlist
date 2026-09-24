@@ -60,11 +60,43 @@ class GamePrice:
     discount_percent: int
     initial_formatted: str
     final_formatted: str
+    coming_soon: bool = False
+    release_date: str = ""
 
     @property
     def has_price(self) -> bool:
         """免费游戏、未发售或无价格信息的条目没有 price_overview。"""
         return self.final_cents is not None
+
+    @property
+    def final_text(self) -> str:
+        """展示用现价。
+
+        统一按配置区域对应的货币符号渲染(如 ¥35 / $50),与史低、历史价等
+        自行计算的金额保持同一种风格;仅在拿不到分值(免费/未发售)时
+        回退到 Steam 返回的现成文本。
+        """
+        return format_money(self.final_cents, self.currency) or self.final_formatted
+
+    @property
+    def initial_text(self) -> str:
+        """展示用原价,规则同 final_text。"""
+        return format_money(self.initial_cents, self.currency) or self.initial_formatted
+
+
+def format_money(cents: int | None, currency: str) -> str:
+    """把「分」格式化为带货币符号的字符串。
+
+    用于自行拼接的价格文本(Steam 只在 price_overview 里返回带符号的现成字符串,
+    而历史价、史低等我们自己记录的数字需要按配置区域对应的货币符号渲染)。
+    """
+    if cents is None:
+        return ""
+    amount = f"{cents / 100:g}"
+    symbol = CURRENCY_SYMBOLS.get(currency or "", "")
+    if symbol:
+        return f"{symbol}{amount}"
+    return f"{amount} {currency}".strip() if currency else amount
 
 
 def extract_appid(text: str) -> int | None:
@@ -104,6 +136,14 @@ class AppNotFoundError(SteamAPIError):
     """AppID 已下架或不存在(appdetails 明确返回 success=false)。"""
 
 
+class HTTPStatusError(SteamAPIError):
+    """接口返回了非 200 状态码(429 限流除外)。"""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
 class SteamAPI:
     """带节流与共享会话的 Steam 公开接口客户端。"""
 
@@ -130,22 +170,33 @@ class SteamAPI:
             self._session = None
 
     async def _throttled_get(self, url: str, params: dict | None = None) -> dict | str:
-        """节流 GET 请求,返回解析后的 JSON(或原始文本)。"""
+        """节流 GET 请求,返回解析后的 JSON(或原始文本)。
+
+        所有网络层异常(超时、连接失败)统一转为 SteamAPIError,
+        这样批量检查时单个游戏的网络抖动只会记为一次失败,不会中断整轮。
+        """
         session = await self._get_session()
         async with self._lock:
             elapsed = time.monotonic() - self._last_request_ts
             if elapsed < self.delay:
                 await asyncio.sleep(self.delay - elapsed)
             self._last_request_ts = time.monotonic()
-        async with session.get(url, params=params) as resp:
-            if resp.status == 429:
-                raise SteamAPIError("请求过于频繁,已被 Steam 临时限流,请稍后再试或调大请求间隔")
-            if resp.status != 200:
-                raise SteamAPIError(f"Steam 接口返回 HTTP {resp.status}")
-            try:
-                return await resp.json()
-            except aiohttp.ContentTypeError:
-                return await resp.text()
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status == 429:
+                    raise SteamAPIError(
+                        "请求过于频繁,已被 Steam 临时限流,请稍后再试或调大请求间隔"
+                    )
+                if resp.status != 200:
+                    raise HTTPStatusError(resp.status, f"Steam 接口返回 HTTP {resp.status}")
+                try:
+                    return await resp.json()
+                except aiohttp.ContentTypeError:
+                    return await resp.text()
+        except asyncio.TimeoutError as e:
+            raise SteamAPIError("Steam 接口响应超时") from e
+        except aiohttp.ClientError as e:
+            raise SteamAPIError(f"网络请求失败: {e}") from e
 
     async def fetch_app_price(self, appid: int) -> GamePrice:
         """查询一个游戏的当前价格快照。"""
@@ -158,6 +209,9 @@ class SteamAPI:
         if not entry.get("success") or "data" not in entry:
             raise AppNotFoundError(f"AppID {appid} 查询失败(可能已下架或参数错误)")
         detail = entry["data"]
+        release = detail.get("release_date") or {}
+        coming_soon = bool(release.get("coming_soon"))
+        release_date = (release.get("date") or "").strip()
         overview = detail.get("price_overview")
         if overview:
             return GamePrice(
@@ -170,6 +224,8 @@ class SteamAPI:
                 discount_percent=overview.get("discount_percent", 0),
                 initial_formatted=overview.get("initial_formatted", ""),
                 final_formatted=overview.get("final_formatted", ""),
+                coming_soon=coming_soon,
+                release_date=release_date,
             )
         # 免费游戏/未上架售卖: 无 price_overview
         return GamePrice(
@@ -182,6 +238,8 @@ class SteamAPI:
             discount_percent=0,
             initial_formatted="",
             final_formatted="免费" if detail.get("is_free") else "暂无售价",
+            coming_soon=coming_soon,
+            release_date=release_date,
         )
 
     async def fetch_wishlist(self, steamid64: str) -> dict[str, str]:
@@ -235,14 +293,14 @@ class SteamAPI:
 
     async def resolve_vanity(self, vanity: str) -> str:
         """将自定义URL名解析为 64 位 SteamID(解析 Steam 社区个人主页 HTML)。"""
-        session = await self._get_session()
-        url = COMMUNITY_ID_URL.format(vanity=vanity)
-        async with session.get(url) as resp:
-            if resp.status == 404:
-                raise SteamAPIError(f"找不到自定义URL「{vanity}」对应的用户")
-            if resp.status != 200:
-                raise SteamAPIError(f"访问 Steam 社区失败(HTTP {resp.status})")
-            html = await resp.text()
+        try:
+            html = await self._throttled_get(COMMUNITY_ID_URL.format(vanity=vanity))
+        except HTTPStatusError as e:
+            if e.status == 404:
+                raise SteamAPIError(f"找不到自定义URL「{vanity}」对应的用户") from e
+            raise
+        if not isinstance(html, str):
+            raise SteamAPIError("访问 Steam 社区返回了非预期数据")
         matched = STEAMID_IN_HTML_PATTERN.search(html)
         if not matched:
             raise SteamAPIError("无法从该用户主页解析出 SteamID,请改用数字ID或完整愿望单链接")

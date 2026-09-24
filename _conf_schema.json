@@ -41,6 +41,18 @@
     "type": "bool",
     "default": false
   },
+  "enable_release_notify": {
+    "description": "愿望单游戏发售时推送提醒",
+    "hint": "监控中的未发售游戏在发售后推送一次提醒",
+    "type": "bool",
+    "default": true
+  },
+  "admin_only": {
+    "description": "仅管理员可执行操作类命令",
+    "hint": "开启后 add/remove/import/sync/unlink/bind 等命令仅群管理员或 AstrBot 管理员可用,查询类命令(list/history/export)不受限制",
+    "type": "bool",
+    "default": false
+  },
   "push_targets": {
     "description": "额外推送目标(unified_msg_origin 列表)",
     "hint": "通常无需手填,直接在会话中发送 /sw bind 即可绑定;此项用于手动追加",
