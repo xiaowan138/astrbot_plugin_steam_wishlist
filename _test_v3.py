@@ -1,4 +1,4 @@
-"""v0.3.0 验证脚本: 6 个 bug 修复 + 6 个新功能。
+﻿"""v0.3.0 验证脚本: 6 个 bug 修复 + 6 个新功能。
 
 运行: python _test_v3.py
 """
@@ -129,6 +129,13 @@ def make_price(appid, final_cents, discount, initial=10000, name=None, currency=
     )
 
 
+class FakeSteamAPI:
+    """测试替身基类: 提供 _check_all 收尾时会调用的退避钩子。"""
+
+    def reset_backoff(self):
+        pass
+
+
 class FakeEvent:
     def __init__(self, umo="umo:test", admin=False):
         self.unified_msg_origin = umo
@@ -195,7 +202,7 @@ async def main():
     captured = []
     p._spawn_bootstrap = lambda appids: captured.append(list(appids))
 
-    class ImportAPI:
+    class ImportAPI(FakeSteamAPI):
         async def fetch_wishlist(self, steamid):
             return {"100": "100", "200": "200", "300": "300"}
 
@@ -217,7 +224,7 @@ async def main():
     captured2 = []
     p2._spawn_bootstrap = lambda appids: captured2.append(list(appids))
 
-    class ImportAPI2:
+    class ImportAPI2(FakeSteamAPI):
         async def fetch_wishlist(self, steamid):
             return {"100": "100"}  # 愿望单里只有那个已在监控的游戏
 
@@ -228,7 +235,7 @@ async def main():
     [r async for r in p2._cmd_import(FakeEvent(), "76561198000000001")]
     check("已监控游戏不进入 bootstrap 轮次", captured2 == [], f"got {captured2}")
 
-    class DropAPI:
+    class DropAPI(FakeSteamAPI):
         async def fetch_app_price(self, appid):
             return make_price(appid, 4000, 60)
 
@@ -250,7 +257,7 @@ async def main():
         p3._init_state(900 + i, make_price(900 + i, 10000, 0))
     p3.storage.add_binding("umo:test")
 
-    class TimeoutAPI:
+    class TimeoutAPI(FakeSteamAPI):
         def __init__(self):
             self.calls = []
 
@@ -268,7 +275,7 @@ async def main():
     p3.api = TimeoutAPI()
     sent.clear()
     result = await p3._check_all(push=True)
-    total, on_sale, pushed, failed, removed, released = result
+    total, on_sale, pushed, failed, removed, released, skipped = result
     check("全部 5 个游戏都被检查", p3.api.calls == [900, 901, 902, 903, 904], p3.api.calls)
     check("失败数记为 1", failed == 1, f"got {failed}")
     check("超时之后的 903/904 仍成功推送", pushed == 2 and len(sent) == 2,

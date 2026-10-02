@@ -47,9 +47,15 @@
     "type": "bool",
     "default": true
   },
+  "push_with_image": {
+    "description": "推送时附带游戏头图",
+    "hint": "关闭后只发送文字,适合图片加载慢或不希望刷屏的会话",
+    "type": "bool",
+    "default": true
+  },
   "admin_only": {
     "description": "仅管理员可执行操作类命令",
-    "hint": "开启后 add/remove/import/sync/unlink/bind 等命令仅群管理员或 AstrBot 管理员可用,查询类命令(list/history/export)不受限制",
+    "hint": "开启后 add/remove/import/sync/unlink/bind/restore 等命令仅群管理员或 AstrBot 管理员可用,查询类命令(list/stats/top/history/export)不受限制",
     "type": "bool",
     "default": false
   },

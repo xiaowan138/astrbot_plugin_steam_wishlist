@@ -32,6 +32,10 @@ CURRENCY_SYMBOLS = {
     "HKD": "HK$", "TWD": "NT$", "RUB": "₽", "KRW": "₩", "SGD": "S$",
 }
 
+# 被限流后退避的上限(秒)与冷却时长倍数
+MAX_REQUEST_DELAY = 30.0
+RATE_LIMIT_COOLDOWN_FACTOR = 5
+
 APP_URL_PATTERN = re.compile(
     r"(?:store\.steampowered\.com|store\.steamchina\.com)/app/(\d+)", re.IGNORECASE
 )
@@ -136,6 +140,10 @@ class AppNotFoundError(SteamAPIError):
     """AppID 已下架或不存在(appdetails 明确返回 success=false)。"""
 
 
+class RateLimitError(SteamAPIError):
+    """被 Steam 限流(HTTP 429)。调用方应暂停本轮检查而不是继续请求。"""
+
+
 class HTTPStatusError(SteamAPIError):
     """接口返回了非 200 状态码(429 限流除外)。"""
 
@@ -150,10 +158,23 @@ class SteamAPI:
     def __init__(self, region: str = "cn", language: str = "schinese", delay: float = 1.5):
         self.region = region
         self.language = language
-        self.delay = max(0.2, delay)
+        self.base_delay = max(0.2, delay)
+        self.delay = self.base_delay
         self._session: aiohttp.ClientSession | None = None
         self._lock = asyncio.Lock()
         self._last_request_ts = 0.0
+        # 被限流后的静默期,期内所有请求先等待再发出
+        self._cooldown_until = 0.0
+
+    def _apply_rate_limit_backoff(self):
+        """收到 429 时指数退避: 拉大请求间隔,并让后续请求先冷却一段时间。"""
+        self.delay = min(self.delay * 2, MAX_REQUEST_DELAY)
+        self._cooldown_until = time.monotonic() + self.delay * RATE_LIMIT_COOLDOWN_FACTOR
+
+    def reset_backoff(self):
+        """一轮检查未被限流时恢复到配置的请求间隔,避免长期停留在退避状态。"""
+        self.delay = self.base_delay
+        self._cooldown_until = 0.0
 
     async def _get_session(self) -> aiohttp.ClientSession:
         async with self._lock:
@@ -177,15 +198,19 @@ class SteamAPI:
         """
         session = await self._get_session()
         async with self._lock:
-            elapsed = time.monotonic() - self._last_request_ts
-            if elapsed < self.delay:
-                await asyncio.sleep(self.delay - elapsed)
+            now = time.monotonic()
+            # 同时遵守「相邻请求间隔」与「限流冷却期」
+            wait = max(self.delay - (now - self._last_request_ts), self._cooldown_until - now)
+            if wait > 0:
+                await asyncio.sleep(wait)
             self._last_request_ts = time.monotonic()
         try:
             async with session.get(url, params=params) as resp:
                 if resp.status == 429:
-                    raise SteamAPIError(
-                        "请求过于频繁,已被 Steam 临时限流,请稍后再试或调大请求间隔"
+                    self._apply_rate_limit_backoff()
+                    raise RateLimitError(
+                        f"请求过于频繁,已被 Steam 限流;已自动把请求间隔调整为 "
+                        f"{self.delay:g} 秒,本轮剩余检查暂停"
                     )
                 if resp.status != 200:
                     raise HTTPStatusError(resp.status, f"Steam 接口返回 HTTP {resp.status}")

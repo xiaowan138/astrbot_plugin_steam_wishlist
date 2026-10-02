@@ -16,7 +16,10 @@
 - /sw unlink <序号>        移除某个愿望单来源(可选连带其游戏)
 - /sw sync                 同步已导入愿望单的新增/移除
 - /sw remove <链接/AppID>  移除监控
+- /sw restore [序号/all]   查看/恢复被移除记录的愿望单游戏
 - /sw list                 查看监控列表与当前价格
+- /sw stats                查看监控概览统计
+- /sw top [N]              按折扣排序查看最划算的监控游戏
 - /sw history <链接/AppID> 查看某游戏的价格走势
 - /sw export               导出监控列表(Markdown)
 - /sw check                立即全量检查并推送
@@ -41,6 +44,7 @@ from .steam_api import (
     SteamAPI,
     SteamAPIError,
     AppNotFoundError,
+    RateLimitError,
     extract_appid,
     extract_wishlist_steamid,
     format_money,
@@ -58,19 +62,25 @@ SEARCH_TTL = 300
 # 插件启动后先等一小段时间再做首轮检查,避免重启后长时间收不到推送
 FIRST_CHECK_DELAY = 90
 # 批量检查时每处理多少个游戏落一次盘(进程崩溃时的状态丢失上限)
-SAVE_EVERY = 25
+SAVE_EVERY = 10
 # 自动检查被配置关闭时,轮询任务进入休眠并周期性复查配置(便于 WebUI 开关即时生效)
 DISABLED_POLL_INTERVAL = 300
+# /sw top 默认与最多展示的条数
+TOP_DEFAULT = 10
+TOP_MAX = 30
 
 HELP_TEXT = """Steam 愿望单监控 指令:
 /sw search <游戏名> - 搜索游戏,如 /sw search portal 2
-/sw add <序号/链接/AppID> - 添加单游戏监控(序号来自最近一次搜索)
-/sw import <愿望单链接或SteamID> - 导入整个公开愿望单
+/sw add <序号/链接/AppID> - 添加监控,支持一次多个(空格分隔)
+/sw import <愿望单链接或SteamID> [别名] - 导入整个公开愿望单
 /sw sources - 查看已导入的愿望单来源
-/sw unlink <序号> - 移除某个愿望单来源
+/sw unlink <序号> [all] - 移除某个愿望单来源
 /sw sync - 同步已导入愿望单的新增/移除
 /sw remove <链接/AppID> - 移除监控
-/sw list - 查看监控列表与当前价格
+/sw restore [序号/all] - 查看或恢复被移除记录的愿望单游戏
+/sw list - 查看监控列表、当前价格与观测期史低
+/sw stats - 查看监控概览统计
+/sw top [N] - 按折扣排序查看最划算的监控游戏
 /sw history <链接/AppID> - 查看某游戏的价格走势
 /sw export - 导出监控列表(Markdown)
 /sw check - 立即全量检查并推送
@@ -82,7 +92,7 @@ HELP_TEXT = """Steam 愿望单监控 指令:
     "astrbot_plugin_steam_wishlist",
     "xiaowan138",
     "Steam 愿望单/单游戏价格监控,折扣达阈值或史低时自动推送",
-    "0.3.0",
+    "0.3.1",
     "https://github.com/xiaowan138/astrbot_plugin_steam_wishlist",
 )
 class SteamWishlistPlugin(Star):
@@ -91,9 +101,9 @@ class SteamWishlistPlugin(Star):
         self.config = config
         self.storage = Storage(StarTools.get_data_dir("astrbot_plugin_steam_wishlist"))
         self.api = SteamAPI(
-            region=config.get("region", "cn"),
-            language=config.get("language", "schinese"),
-            delay=float(config.get("request_delay_seconds", 1.5)),
+            region=self._config_str("region", "cn"),
+            language=self._config_str("language", "schinese"),
+            delay=self._config_float("request_delay_seconds", 1.5, minimum=0.2, maximum=60),
         )
         self._loop_task: asyncio.Task | None = None
         self._bg_tasks: set[asyncio.Task] = set()
@@ -121,6 +131,59 @@ class SteamWishlistPlugin(Star):
         await self.api.close()
         self.storage.save()
 
+    # ==================== 配置读取 ====================
+    # WebUI 里把配置字段清空会写成 null,直接 int()/float() 会抛 TypeError。
+    # 检查轮次里任何一处未捕获的异常都会中断整轮,因此统一在这里兜底并夹取范围。
+
+    def _config_int(self, key: str, default: int, minimum: int | None = None,
+                    maximum: int | None = None) -> int:
+        try:
+            value = int(self.config.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        if minimum is not None:
+            value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    def _config_float(self, key: str, default: float, minimum: float | None = None,
+                      maximum: float | None = None) -> float:
+        try:
+            value = float(self.config.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        if minimum is not None:
+            value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    def _config_bool(self, key: str, default: bool) -> bool:
+        """兼容 WebUI 传来的字符串/数字写法,避免 bool("false") == True 这类坑。"""
+        value = self.config.get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return default
+
+    def _config_str(self, key: str, default: str) -> str:
+        value = self.config.get(key, default)
+        if not isinstance(value, str) or not value.strip():
+            return default
+        return value.strip()
+
+    def _config_list(self, key: str) -> list[str]:
+        value = self.config.get(key) or []
+        if isinstance(value, str):
+            return [value] if value.strip() else []
+        if isinstance(value, (list, tuple)):
+            return [str(item) for item in value if item]
+        return []
+
     @filter.on_astrbot_loaded()
     async def on_loaded(self):
         if self._maybe_start_loop():
@@ -147,6 +210,10 @@ class SteamWishlistPlugin(Star):
             yield event.plain_result(self._cmd_export())
         elif sub in ("sources", "来源"):
             yield event.plain_result(self._cmd_sources())
+        elif sub == "stats":
+            yield event.plain_result(self._cmd_stats())
+        elif sub == "top":
+            yield event.plain_result(self._cmd_top(arg))
         elif sub == "search":
             async for r in self._cmd_search(event, arg):
                 yield r
@@ -164,6 +231,8 @@ class SteamWishlistPlugin(Star):
                 yield r
         elif sub in ("remove", "rm", "删除"):
             yield event.plain_result(self._cmd_remove(event, arg))
+        elif sub in ("restore", "恢复"):
+            yield event.plain_result(self._cmd_restore(event, arg))
         elif sub == "history":
             yield event.plain_result(self._cmd_history(event, arg))
         elif sub == "check":
@@ -174,7 +243,7 @@ class SteamWishlistPlugin(Star):
 
     def _deny_if_not_admin(self, event: AstrMessageEvent) -> str | None:
         """破坏性/影响全局的命令在开启限制时仅管理员可用。返回拒绝文案或 None。"""
-        if not self.config.get("admin_only", False):
+        if not self._config_bool("admin_only", False):
             return None
         is_admin = getattr(event, "is_admin", None)
         if callable(is_admin) and is_admin():
@@ -192,21 +261,20 @@ class SteamWishlistPlugin(Star):
         return "当前会话已绑定过。"
 
     def _cmd_unbind(self, event: AstrMessageEvent) -> str:
-        denied = self._deny_if_not_admin(event)
-        if denied:
-            return denied
+        """解绑只影响当前会话自身,因此不受 admin_only 限制,避免普通用户无法退订。"""
         if self.storage.remove_binding(event.unified_msg_origin):
             self.storage.save()
             return "已解绑当前会话。"
         return "当前会话尚未绑定。"
 
     def _cmd_status(self) -> str:
-        cfg_targets = [t for t in self.config.get("push_targets", []) if t]
+        cfg_targets = self._config_list("push_targets")
         total_bindings = len(set(self.storage.bindings) | set(cfg_targets))
+        interval_hours = self._config_int("check_interval_hours", 6, minimum=1)
         if not self._config_enabled():
             state = "自动检查已关闭(仅手动 /sw check)"
         elif self._loop_task and not self._loop_task.done():
-            state = f"运行中(间隔 {self.config.get('check_interval_hours', 6)} 小时)"
+            state = f"运行中(间隔 {interval_hours} 小时)"
         else:
             state = "已停止"
         next_line = ""
@@ -219,13 +287,19 @@ class SteamWishlistPlugin(Star):
                 f"愿望单来源: {len(self.storage.wishlist_sources)} 个"
                 f"(使用 /sw sources 查看、/sw sync 同步)\n"
             )
+        dismissed_line = ""
+        if self.storage.dismissed:
+            dismissed_line = (
+                f"已移除记录: {len(self.storage.dismissed)} 个(使用 /sw restore 查看/恢复)\n"
+            )
         return (
             f"Steam 愿望单监控\n"
             f"监控游戏: {len(self.storage.games)} 个\n"
             f"推送绑定: {total_bindings} 个会话\n"
-            f"折扣阈值: {self.config.get('discount_threshold', 30)}%\n"
-            f"区域/语言: {self.config.get('region', 'cn')} / {self.config.get('language', 'schinese')}\n"
-            f"{sync_line}"
+            f"折扣阈值: {self._config_int('discount_threshold', 30, minimum=0, maximum=100)}%\n"
+            f"区域/语言: {self._config_str('region', 'cn')} / {self._config_str('language', 'schinese')}\n"
+            f"请求间隔: {self.api.delay:g} 秒\n"
+            f"{sync_line}{dismissed_line}"
             f"后台任务: {state}\n{next_line}"
         )
 
@@ -233,8 +307,14 @@ class SteamWishlistPlugin(Star):
         """列表/导出共用的单行价格描述。
 
         金额统一走 format_money,保证与史低、历史价的渲染风格一致。
+        未发售与「还没跑过检查」要区分开,否则用户分不清是未发售还是数据缺失。
         """
         state = self.storage.price_state.get(appid, {})
+        if state.get("coming_soon"):
+            release = state.get("release_date") or "发售时间未定"
+            return f"未发售({release})"
+        if not state:
+            return "待建立价格基线"
         currency = state.get("currency", "")
         current = format_money(state.get("last_seen_final"), currency) or state.get("final_formatted")
         if state.get("discount_percent"):
@@ -282,13 +362,87 @@ class SteamWishlistPlugin(Star):
         for appid, game in items:
             state = self.storage.price_state.get(appid, {})
             currency = state.get("currency", "")
-            price = format_money(state.get("last_seen_final"), currency) or state.get(
-                "final_formatted"
-            ) or "暂无数据"
-            discount = f"-{state['discount_percent']}%" if state.get("discount_percent") else "-"
-            lowest = format_money(state.get("min_final"), currency) or "-"
+            if state.get("coming_soon"):
+                price = f"未发售({state.get('release_date') or '时间未定'})"
+                discount = "-"
+                lowest = "-"
+            else:
+                price = format_money(state.get("last_seen_final"), currency) or state.get(
+                    "final_formatted"
+                ) or "待建立基线"
+                discount = (
+                    f"-{state['discount_percent']}%" if state.get("discount_percent") else "-"
+                )
+                lowest = format_money(state.get("min_final"), currency) or "-"
             name = str(game.get("name", "")).replace("|", "\\|")
-            lines.append(f"| {name} | {appid} | {price} | {discount} | {lowest or '-'} |")
+            lines.append(f"| {name} | {appid} | {price} | {discount} | {lowest} |")
+        return "\n".join(lines)
+
+    def _cmd_stats(self) -> str:
+        """监控概览: 基线覆盖率、当前折扣分布,便于判断是否需要调整阈值。"""
+        if not self.storage.games:
+            return "监控列表为空,暂无统计数据。"
+        threshold = self._config_int("discount_threshold", 30, minimum=0, maximum=100)
+        baseline = coming = on_sale = above = at_lowest = 0
+        discounts: list[int] = []
+        for appid in self.storage.games:
+            state = self.storage.price_state.get(appid) or {}
+            if state.get("coming_soon"):
+                coming += 1
+                continue
+            if state.get("last_seen_final") is None:
+                continue
+            baseline += 1
+            percent = state.get("discount_percent") or 0
+            if percent > 0:
+                on_sale += 1
+                discounts.append(percent)
+                if percent >= threshold:
+                    above += 1
+            if state.get("min_final") is not None and state.get("min_final") == state.get(
+                "last_seen_final"
+            ):
+                at_lowest += 1
+        total = len(self.storage.games)
+        avg = f"{sum(discounts) / len(discounts):.1f}%" if discounts else "-"
+        best = f"-{max(discounts)}%" if discounts else "-"
+        return (
+            f"监控概览\n"
+            f"监控总数: {total} 个(已建立基线 {baseline}、未发售 {coming})\n"
+            f"当前打折: {on_sale} 个,其中达到阈值({threshold}%): {above} 个\n"
+            f"折扣幅度: 平均 {avg},最大 {best}\n"
+            f"处于观测史低: {at_lowest} 个\n"
+            f"提示: 用 /sw top 查看最划算的几款"
+        )
+
+    def _cmd_top(self, arg: str) -> str:
+        """按折扣排序,只看当前在打折的监控游戏。"""
+        if not self.storage.games:
+            return "监控列表为空,暂无内容可排序。"
+        count = TOP_DEFAULT
+        if arg:
+            try:
+                count = max(1, min(TOP_MAX, int(arg)))
+            except ValueError:
+                return f"条数「{arg}」无效,请输入 1-{TOP_MAX} 之间的整数。"
+        ranked: list[tuple[int, int, str]] = []
+        for appid in self.storage.games:
+            state = self.storage.price_state.get(appid) or {}
+            percent = state.get("discount_percent") or 0
+            if percent <= 0 or state.get("last_seen_final") is None:
+                continue
+            # 折扣相同时,离观测史低越近的排前面
+            gap = (state.get("min_final") or 0) - state["last_seen_final"]
+            ranked.append((percent, -gap, appid))
+        if not ranked:
+            return "当前没有任何监控中的游戏在打折,稍后再来看看。"
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        lines = [f"当前折扣排行(共 {len(ranked)} 个打折中):"]
+        for index, (_, _, appid) in enumerate(ranked[:count], 1):
+            name = self.storage.games[appid].get("name", appid)
+            lines.append(f"{index}. {name} ({appid}) · {self._price_line(appid)}")
+        if len(ranked) > count:
+            lines.append(f"... 及另外 {len(ranked) - count} 个(用 /sw top {TOP_MAX} 查看更多)")
         return "\n".join(lines)
 
     def _cmd_sources(self) -> str:
@@ -336,33 +490,57 @@ class SteamWishlistPlugin(Star):
             yield event.plain_result(denied)
             return
         if not arg:
-            yield event.plain_result("用法: /sw add <序号/商店链接/AppID>\n可先 /sw search <游戏名> 再按序号添加。")
-            return
-        appid = self._resolve_appid(event, arg)
-        if appid is None:
             yield event.plain_result(
-                "无法识别游戏。请提供 Steam 商店链接、纯数字 AppID,"
-                "或先 /sw search 后使用序号添加。"
+                "用法: /sw add <序号/商店链接/AppID> [更多...]\n"
+                "支持一次添加多个,用空格分隔,例如 /sw add 620 570 https://store.steampowered.com/app/1145360/\n"
+                "可先 /sw search <游戏名> 再按序号添加。"
             )
             return
-        if str(appid) in self.storage.games:
-            yield event.plain_result(f"「{self.storage.games[str(appid)]['name']}」已在监控中。")
+        tokens = arg.split()
+        added: list[GamePrice] = []
+        problems: list[str] = []
+        for token in tokens:
+            appid = self._resolve_appid(event, token)
+            if appid is None:
+                problems.append(f"「{token}」无法识别(需要商店链接、纯数字 AppID 或搜索序号)")
+                continue
+            key = str(appid)
+            if key in self.storage.games:
+                problems.append(f"「{self.storage.games[key]['name']}」已在监控中")
+                continue
+            try:
+                price = await self.api.fetch_app_price(appid)
+            except SteamAPIError as e:
+                problems.append(f"AppID {appid} 查询失败: {e}")
+                continue
+            self.storage.add_game(appid, price.name)
+            self.storage.undismiss(appid)
+            self._init_state(appid, price)
+            added.append(price)
+        if added:
+            self.storage.save()
+
+        if len(tokens) == 1:
+            if added:
+                yield event.plain_result(self._added_detail_text(added[0]))
+            else:
+                yield event.plain_result(problems[0])
             return
-        try:
-            price = await self.api.fetch_app_price(appid)
-        except SteamAPIError as e:
-            yield event.plain_result(f"查询失败: {e}")
-            return
-        self.storage.add_game(appid, price.name)
-        self.storage.undismiss(appid)
-        self._init_state(appid, price)
-        self.storage.save()
+
+        lines = [f"批量添加完成: 成功 {len(added)} 个,失败 {len(problems)} 个。"]
+        for price in added:
+            lines.append(f"✓ {price.name} ({price.appid}) · {self._price_line(str(price.appid))}")
+        lines.extend(f"✗ {item}" for item in problems)
+        yield event.plain_result("\n".join(lines))
+
+    def _added_detail_text(self, price: GamePrice) -> str:
+        """单个游戏添加成功后的详细回执。"""
         if price.coming_soon:
-            yield event.plain_result(
+            return (
                 f"已添加监控:「{price.name}」\n该游戏尚未发售"
                 f"(预计 {price.release_date or '时间未定'}),发售时会推送提醒。"
             )
-        elif price.has_price:
+        if price.has_price:
             if price.discount_percent:
                 desc = (
                     f"原价 {price.initial_text},现价 {price.final_text}"
@@ -370,11 +548,11 @@ class SteamWishlistPlugin(Star):
                 )
             else:
                 desc = f"当前售价 {price.final_text}(无折扣)"
-            yield event.plain_result(f"已添加监控:「{price.name}」\n{desc}。")
-        else:
-            yield event.plain_result(
-                f"已添加监控:「{price.name}」({price.final_text}),该游戏暂无付费价格,仅在出现售价变动时跟踪。"
-            )
+            return f"已添加监控:「{price.name}」\n{desc}。"
+        return (
+            f"已添加监控:「{price.name}」({price.final_text}),"
+            f"该游戏暂无付费价格,仅在出现售价变动时跟踪。"
+        )
 
     def _resolve_appid(self, event: AstrMessageEvent, arg: str) -> int | None:
         """解析添加目标: 优先按最近搜索的序号,其次商店链接/纯数字 AppID。"""
@@ -394,21 +572,26 @@ class SteamWishlistPlugin(Star):
             return
         if not arg:
             yield event.plain_result(
-                "用法: /sw import <愿望单链接或SteamID>\n"
-                "示例: /sw import https://steamcommunity.com/profiles/76561198xxxx/wishlist\n"
-                "或自定义URL: /sw import https://store.steampowered.com/wishlist/id/yourname/"
+                "用法: /sw import <愿望单链接或SteamID> [别名]\n"
+                "示例: /sw import https://steamcommunity.com/profiles/76561198xxxx/wishlist 我的愿望单\n"
+                "或自定义URL: /sw import https://store.steampowered.com/wishlist/id/yourname/ yourname"
             )
             return
-        steamid = extract_wishlist_steamid(arg)
+        # 第一个 token 是链接/ID,其余作为别名(链接与自定义URL名都不含空格)
+        parts = arg.split()
+        target, alias = parts[0], " ".join(parts[1:]).strip()
+        steamid = extract_wishlist_steamid(target)
         if steamid is None:
             yield event.plain_result("无法识别愿望单,请提供完整愿望单链接或 17 位 SteamID。")
             return
         yield event.plain_result("正在拉取愿望单,请稍候...")
-        label = ""
+        label = alias
         try:
             if steamid.startswith("vanity:"):
-                label = steamid[7:]
-                steamid = await self.api.resolve_vanity(label)
+                vanity_name = steamid[7:]
+                steamid = await self.api.resolve_vanity(vanity_name)
+                if not label:
+                    label = vanity_name
             wishlist = await self.api.fetch_wishlist(steamid)
         except SteamAPIError as e:
             yield event.plain_result(f"拉取愿望单失败: {e}")
@@ -548,9 +731,49 @@ class SteamWishlistPlugin(Star):
             return f"AppID {appid} 不在监控列表中。"
         # 来自愿望单的游戏被手动移除时记录,避免 /sw sync 又自动加回来
         if game.get("source") and game["source"] != MANUAL_SOURCE:
-            self.storage.dismiss(appid)
+            self.storage.dismiss(appid, game.get("name", ""))
         self.storage.save()
         return f"已移除监控:「{game['name']}」。"
+
+    def _cmd_restore(self, event: AstrMessageEvent, arg: str) -> str:
+        """查看/恢复被移除记录的愿望单游戏,给 dismissed 一个出口。"""
+        denied = self._deny_if_not_admin(event)
+        if denied:
+            return denied
+        dismissed = list(self.storage.dismissed)
+        if not dismissed:
+            return "没有被移除记录的愿望单游戏。"
+        if not arg:
+            lines = [f"被移除记录的愿望单游戏({len(dismissed)} 个):"]
+            lines += [
+                f"{index}. {self.storage.dismissed_label(appid)} ({appid})"
+                for index, appid in enumerate(dismissed, 1)
+            ]
+            lines.append("用 /sw restore <序号|AppID> 恢复,或 /sw restore all 全部恢复。")
+            return "\n".join(lines)
+
+        token = arg.strip()
+        if token.lower() in ("all", "全部"):
+            targets = dismissed
+        elif token.isdigit() and 1 <= int(token) <= len(dismissed):
+            targets = [dismissed[int(token) - 1]]
+        elif token in dismissed:
+            targets = [token]
+        else:
+            return f"序号「{token}」无效,请输入 1-{len(dismissed)},或使用 /sw restore all。"
+
+        restored: list[str] = []
+        for appid in targets:
+            name = self.storage.dismissed_label(appid)
+            self.storage.undismiss(int(appid))
+            if appid not in self.storage.games:
+                self.storage.add_game(int(appid), name)
+                restored.append(appid)
+        self.storage.save()
+        if restored:
+            self._spawn_bootstrap(restored)
+            return f"已恢复 {len(restored)} 个游戏到监控中,价格基线正在后台建立。"
+        return "这些游戏已在监控列表中,已清除移除记录。"
 
     def _cmd_history(self, event: AstrMessageEvent, arg: str) -> str:
         if not arg:
@@ -600,7 +823,7 @@ class SteamWishlistPlugin(Star):
         if result is None:
             yield event.plain_result("已有检查正在进行(可能是后台轮询),请稍候再试。")
             return
-        total, on_sale, pushed, failed, removed, released = result
+        total, on_sale, pushed, failed, removed, released, skipped = result
         msg = (
             f"检查完成: {total} 个游戏,当前打折 {on_sale} 个,本次推送 {pushed} 条,失败 {failed} 个。"
         )
@@ -608,12 +831,17 @@ class SteamWishlistPlugin(Star):
             msg += f"\n其中 {released} 个游戏已发售,已推送提醒。"
         if removed:
             msg += f"\n已自动移除 {removed} 个疑似下架的游戏。"
+        if skipped:
+            msg += (
+                f"\n⚠️ 被 Steam 限流,本轮提前结束,剩余 {skipped} 个游戏未检查。"
+                f"插件已自动拉大请求间隔,稍后自动重试。"
+            )
         yield event.plain_result(msg)
 
     # ==================== 后台轮询 ====================
 
     def _config_enabled(self) -> bool:
-        return bool(self.config.get("enable_auto_check", True))
+        return self._config_bool("enable_auto_check", True)
 
     def _maybe_start_loop(self) -> bool:
         """启动轮询任务(幂等),返回本次是否真正启动。
@@ -642,7 +870,7 @@ class SteamWishlistPlugin(Star):
                     interval = FIRST_CHECK_DELAY
                     first_round = False
                 else:
-                    interval = max(1, int(self.config.get("check_interval_hours", 6))) * 3600
+                    interval = self._config_int("check_interval_hours", 6, minimum=1) * 3600
                 self._next_check_ts = time.time() + interval
                 await asyncio.sleep(interval)
                 if not self.storage.games:
@@ -663,21 +891,27 @@ class SteamWishlistPlugin(Star):
 
     async def _check_all(
         self, push: bool, only: list[str] | None = None
-    ) -> tuple[int, int, int, int, int, int] | None:
+    ) -> tuple[int, int, int, int, int, int, int] | None:
         """全量检查。
 
-        返回 (总数, 打折数, 推送数, 失败数, 自动移除数, 发售数);已有检查进行中返回 None。
+        返回 (总数, 打折数, 推送数, 失败数, 自动移除数, 发售数, 限流跳过数);
+        已有检查进行中返回 None。
+
+        单个游戏的任何异常都只记为一次失败,绝不中断整轮:
+        网络抖动、被限流、以及检查途中游戏被 /sw remove 都属此类。
         """
         if self._checking:
             return None
         self._checking = True
-        total = on_sale = failed = removed_cnt = released_cnt = 0
+        total = on_sale = failed = removed_cnt = released_cnt = skipped = 0
         to_push: list[tuple[GamePrice, str]] = []
+        rate_limited = False
         try:
-            targets = only or list(self.storage.games.keys())
+            # 注意用 is None 判断: only=[] 是合法的「不检查任何游戏」,不能被 or 吞掉
+            targets = list(self.storage.games.keys()) if only is None else list(only)
             total = len(targets)
             since_save = 0
-            for appid_str in targets:
+            for index, appid_str in enumerate(targets):
                 game = self.storage.games.get(appid_str)
                 if not game:
                     continue
@@ -701,6 +935,14 @@ class SteamWishlistPlugin(Star):
                         self.storage.save()
                         since_save = 0
                     continue
+                except RateLimitError as e:
+                    # 已被限流,继续请求只会加剧;提前结束本轮,剩下的交给下一轮。
+                    # 触发限流的这个游戏已计入 failed,skip 只统计其后完全未请求的游戏
+                    failed += 1
+                    rate_limited = True
+                    skipped = len(targets) - index - 1
+                    logger.warning(f"Steam 愿望单监控: {e},本轮剩余 {skipped} 个游戏未检查")
+                    break
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -708,12 +950,23 @@ class SteamWishlistPlugin(Star):
                     failed += 1
                     logger.warning(f"Steam 愿望单监控: AppID {appid_str} 查询失败 {e}")
                     continue
-                # 占位名回填或游戏改名同步
-                if game.get("name") != price.name:
-                    self.storage.games[appid_str]["name"] = price.name
-                should_push, is_on_sale, reason = self._update_state_and_decide(
-                    int(appid_str), price, record_push=push
-                )
+
+                # 请求飞行期间用户可能已经 /sw remove 了该游戏:
+                # 此时继续写状态会 KeyError 中断整轮,也会把已删的 price_state 复活
+                if appid_str not in self.storage.games:
+                    continue
+                try:
+                    # 占位名回填或游戏改名同步
+                    if game.get("name") != price.name:
+                        self.storage.games[appid_str]["name"] = price.name
+                    should_push, is_on_sale, reason = self._update_state_and_decide(
+                        int(appid_str), price, record_push=push
+                    )
+                except Exception as e:
+                    # 状态更新异常同样只影响这一个游戏
+                    failed += 1
+                    logger.warning(f"Steam 愿望单监控: AppID {appid_str} 状态更新失败 {e}")
+                    continue
                 if is_on_sale:
                     on_sale += 1
                 if reason == "released":
@@ -726,10 +979,15 @@ class SteamWishlistPlugin(Star):
                     since_save = 0
             self.storage.save()
             if push and to_push:
-                await self._push_results(to_push)
-            return total, on_sale, len(to_push), failed, removed_cnt, released_cnt
+                pushed = await self._push_results(to_push)
+            else:
+                pushed = 0
+            return total, on_sale, pushed, failed, removed_cnt, released_cnt, skipped
         finally:
             self._checking = False
+            # 本轮未被限流说明请求间隔是安全的,恢复配置值,避免长期停留在退避状态
+            if not rate_limited:
+                self.api.reset_backoff()
 
     def _init_state(self, appid: int, price: GamePrice):
         """添加游戏时建立价格基线: 记录当前价并作为观测期最低价,不触发推送。"""
@@ -769,7 +1027,7 @@ class SteamWishlistPlugin(Star):
         """
         state = self.storage.get_state(appid)
         now = int(time.time())
-        notify_release = bool(self.config.get("enable_release_notify", True))
+        notify_release = self._config_bool("enable_release_notify", True)
 
         # 发售提醒: 此前标记为未发售,现在已发售
         released = bool(state and state.get("coming_soon") and not price.coming_soon)
@@ -807,10 +1065,10 @@ class SteamWishlistPlugin(Star):
             reason = "released"
         elif state:
             if is_on_sale:
-                threshold = int(self.config.get("discount_threshold", 30))
+                threshold = self._config_int("discount_threshold", 30, minimum=0, maximum=100)
                 price_dropped = old_seen is not None and price.final_cents < old_seen
                 threshold_ok = price.discount_percent >= threshold
-                lowest_only_ok = (not self.config.get("notify_lowest_only", False)) or is_new_lowest
+                lowest_only_ok = (not self._config_bool("notify_lowest_only", False)) or is_new_lowest
                 already_pushed = price.final_cents == state.get("last_pushed_final")
                 should_push = price_dropped and threshold_ok and lowest_only_ok and not already_pushed
                 if should_push:
@@ -861,16 +1119,23 @@ class SteamWishlistPlugin(Star):
     # ==================== 推送 ====================
 
     def _all_bindings(self) -> list[str]:
-        cfg_targets = [t for t in self.config.get("push_targets", []) if t]
-        return list(dict.fromkeys(self.storage.bindings + cfg_targets))
+        return list(dict.fromkeys(self.storage.bindings + self._config_list("push_targets")))
 
-    async def _push_results(self, items: list[tuple[GamePrice, str]]):
-        """少量推送用带图消息;超过阈值合并为一条聚合消息防刷屏。"""
+    async def _push_results(self, items: list[tuple[GamePrice, str]]) -> int:
+        """少量推送用带图消息;超过阈值合并为一条聚合消息防刷屏。
+
+        返回实际推送成功的游戏数: 没有绑定会话时返回 0,
+        避免 /sw check 在没人接收的情况下谎报推送条数。
+        """
+        if not self._all_bindings():
+            return 0
         if len(items) <= AGGREGATE_LIMIT:
+            sent = 0
             for price, reason in items:
-                await self._push_discount(price, reason)
-        else:
-            await self._push_aggregated(items)
+                if await self._push_discount(price, reason):
+                    sent += 1
+            return sent
+        return await self._push_aggregated(items)
 
     def _push_text(self, price: GamePrice, reason: str) -> str:
         state = self.storage.get_state(price.appid)
@@ -909,26 +1174,31 @@ class SteamWishlistPlugin(Star):
             f"🔗 {url}"
         )
 
-    async def _push_discount(self, price: GamePrice, reason: str):
+    async def _push_discount(self, price: GamePrice, reason: str) -> bool:
+        """推送到所有绑定会话,返回是否至少有一个会话收到了消息。"""
         bindings = self._all_bindings()
         if not bindings:
-            return
+            return False
         text = self._push_text(price, reason)
+        with_image = self._config_bool("push_with_image", True)
+        delivered = False
         for umo in bindings:
             try:
                 chain = MessageChain()
-                if price.header_image:
+                if price.header_image and with_image:
                     chain.url_image(price.header_image)
                 chain.message(text)
                 await self.context.send_message(umo, chain)
+                delivered = True
             except Exception as e:
                 logger.warning(f"Steam 愿望单监控: 推送到 {umo} 失败 {e}")
+        return delivered
 
-    async def _push_aggregated(self, items: list[tuple[GamePrice, str]]):
-        """多游戏同时达标时合并为一条纯文本消息。"""
+    async def _push_aggregated(self, items: list[tuple[GamePrice, str]]) -> int:
+        """多游戏同时达标时合并为一条纯文本消息,返回实际推送的游戏数。"""
         bindings = self._all_bindings()
         if not bindings:
-            return
+            return 0
         lines = [f"🎮 Steam 折扣提醒({len(items)} 个游戏)"]
         for price, reason in items:
             state = self.storage.get_state(price.appid)
@@ -946,10 +1216,13 @@ class SteamWishlistPlugin(Star):
                     f"「{price.name}」-{price.discount_percent}% → {price.final_text}{tag}  {url}"
                 )
         text = "\n".join(lines)
+        delivered = False
         for umo in bindings:
             try:
                 chain = MessageChain()
                 chain.message(text)
                 await self.context.send_message(umo, chain)
+                delivered = True
             except Exception as e:
                 logger.warning(f"Steam 愿望单监控: 聚合推送到 {umo} 失败 {e}")
+        return len(items) if delivered else 0

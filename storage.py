@@ -9,6 +9,7 @@
 - bindings:         [unified_msg_origin, ...]
 - wishlist_sources: {steamid64: {"label": str, "added_at": int}}  通过 /sw import 记录,供 /sw sync 使用
 - dismissed:        [appid(str), ...]  用户手动移除的来自愿望单的游戏,sync 时不再自动加回
+- dismissed_names:  {appid(str): str}  上面这些游戏被移除时的名字,供 /sw restore 展示
 """
 
 import json
@@ -35,6 +36,7 @@ class Storage:
         self.bindings: list[str] = []
         self.wishlist_sources: dict[str, dict] = {}
         self.dismissed: list[str] = []
+        self.dismissed_names: dict[str, str] = {}
         self.load()
 
     def load(self):
@@ -47,11 +49,13 @@ class Storage:
             self.price_state = data.get("price_state", {})
             self.bindings = data.get("bindings", [])
             self.dismissed = data.get("dismissed", [])
+            self.dismissed_names = data.get("dismissed_names", {}) or {}
             self.wishlist_sources = self._normalize_sources(data.get("wishlist_sources", []))
         except (json.JSONDecodeError, OSError):
             # 数据文件损坏时保留空态,不中断插件加载
             self.games, self.price_state, self.bindings = {}, {}, []
             self.wishlist_sources, self.dismissed = {}, []
+            self.dismissed_names = {}
 
     @staticmethod
     def _normalize_sources(raw) -> dict[str, dict]:
@@ -72,6 +76,7 @@ class Storage:
             "bindings": self.bindings,
             "wishlist_sources": self.wishlist_sources,
             "dismissed": self.dismissed,
+            "dismissed_names": self.dismissed_names,
         }
         fd, tmp_path = tempfile.mkstemp(dir=str(self.data_dir), suffix=".tmp")
         try:
@@ -114,8 +119,9 @@ class Storage:
     # ---- 愿望单来源与移除记录 ----
 
     def add_wishlist_source(self, steamid: str, label: str = "") -> bool:
+        """登记愿望单来源。已存在时若本次带了别名就覆盖,便于通过重新导入重命名。"""
         if steamid in self.wishlist_sources:
-            if label and not self.wishlist_sources[steamid].get("label"):
+            if label:
                 self.wishlist_sources[steamid]["label"] = label
             return False
         self.wishlist_sources[steamid] = {"label": label, "added_at": int(time.time())}
@@ -138,17 +144,28 @@ class Storage:
         if len(history) > PRICE_HISTORY_LIMIT:
             del history[: len(history) - PRICE_HISTORY_LIMIT]
 
-    def dismiss(self, appid: int):
-        """记录用户主动移除的愿望单游戏,/sw sync 时不再自动加回。"""
+    def dismiss(self, appid: int, name: str = ""):
+        """记录用户主动移除的愿望单游戏,/sw sync 时不再自动加回。
+
+        同时留下名字,供 /sw restore 列表展示(此时 games 里已查不到该游戏)。
+        """
         key = str(appid)
         if key not in self.dismissed:
             self.dismissed.append(key)
+        if name:
+            self.dismissed_names[key] = name
 
     def undismiss(self, appid: int):
-        """用户重新手动添加时,解除移除记录。"""
+        """用户重新手动添加/恢复时,解除移除记录。"""
         key = str(appid)
         if key in self.dismissed:
             self.dismissed.remove(key)
+        self.dismissed_names.pop(key, None)
+
+    def dismissed_label(self, appid: int) -> str:
+        """移除记录中该游戏的展示名,没有记录时回退为 AppID。"""
+        key = str(appid)
+        return self.dismissed_names.get(key) or f"AppID {key}"
 
     # ---- 推送绑定 ----
 
